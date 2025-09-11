@@ -1,5 +1,5 @@
 use crate::protocol::EventMsg;
-use crate::rollout::recorder::RolloutItem;
+use crate::protocol::RolloutItem;
 use codex_protocol::models::ResponseItem;
 
 /// Whether a rollout `item` should be persisted in rollout files.
@@ -65,6 +65,6 @@ pub(crate) fn should_persist_event_msg(ev: &EventMsg) -> bool {
         | EventMsg::PlanUpdate(_)
         | EventMsg::TurnAborted(_)
         | EventMsg::ShutdownComplete
-        | EventMsg::ConversationHistory(_) => false,
+        | EventMsg::ConversationPath(_) => false,
     }
 }
