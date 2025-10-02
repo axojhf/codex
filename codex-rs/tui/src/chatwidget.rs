@@ -41,7 +41,7 @@ use codex_core::protocol::TurnDiffEvent;
 use codex_core::protocol::UserMessageEvent;
 use codex_core::protocol::WebSearchBeginEvent;
 use codex_core::protocol::WebSearchEndEvent;
-use codex_protocol::mcp_protocol::ConversationId;
+use codex_protocol::ConversationId;
 use codex_protocol::parse_command::ParsedCommand;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -59,6 +59,7 @@ use tracing::debug;
 
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
+use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::BottomPane;
 use crate::bottom_pane::BottomPaneParams;
 use crate::bottom_pane::CancellationEvent;
@@ -78,14 +79,11 @@ use crate::history_cell;
 use crate::history_cell::AgentMessageCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::McpToolCallCell;
-use crate::history_cell::PatchEventType;
-use crate::history_cell::RateLimitSnapshotDisplay;
 use crate::markdown::append_markdown;
 use crate::slash_command::SlashCommand;
+use crate::status::RateLimitSnapshotDisplay;
 use crate::text_formatting::truncate_text;
 use crate::tui::FrameRequester;
-// streaming internals are provided by crate::streaming and crate::markdown_stream
-use crate::bottom_pane::ApprovalRequest;
 mod interrupts;
 use self::interrupts::InterruptManager;
 mod agent;
@@ -255,6 +253,10 @@ pub(crate) struct ChatWidget {
     // List of ghost commits corresponding to each turn.
     ghost_snapshots: Vec<GhostCommit>,
     ghost_snapshots_disabled: bool,
+    // Whether to add a final message separator after the last message
+    needs_final_message_separator: bool,
+
+    last_rendered_width: std::cell::Cell<Option<usize>>,
 }
 
 struct UserMessage {
@@ -393,9 +395,16 @@ impl ChatWidget {
     }
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {
-        if info.is_some() {
-            self.bottom_pane.set_token_usage(info.clone());
-            self.token_info = info;
+        if let Some(info) = info {
+            let context_window = info
+                .model_context_window
+                .or(self.config.model_context_window);
+            let percent = context_window.map(|window| {
+                info.last_token_usage
+                    .percent_of_context_window_remaining(window)
+            });
+            self.bottom_pane.set_context_window_percent(percent);
+            self.token_info = Some(info);
         }
     }
 
@@ -417,7 +426,7 @@ impl ChatWidget {
                     .and_then(|window| window.window_minutes),
             );
 
-            let display = history_cell::rate_limit_snapshot_display(&snapshot, Local::now());
+            let display = crate::status::rate_limit_snapshot_display(&snapshot, Local::now());
             self.rate_limit_snapshot = Some(display);
 
             if !warnings.is_empty() {
@@ -524,9 +533,6 @@ impl ChatWidget {
 
     fn on_patch_apply_begin(&mut self, event: PatchApplyBeginEvent) {
         self.add_to_history(history_cell::new_patch_event(
-            PatchEventType::ApplyBegin {
-                auto_approved: event.auto_approved,
-            },
             event.changes,
             &self.config.cwd,
         ));
@@ -650,7 +656,18 @@ impl ChatWidget {
         self.flush_active_cell();
 
         if self.stream_controller.is_none() {
-            self.stream_controller = Some(StreamController::new(self.config.clone()));
+            if self.needs_final_message_separator {
+                let elapsed_seconds = self
+                    .bottom_pane
+                    .status_widget()
+                    .map(super::status_indicator_widget::StatusIndicatorWidget::elapsed_seconds);
+                self.add_to_history(history_cell::FinalMessageSeparator::new(elapsed_seconds));
+                self.needs_final_message_separator = false;
+            }
+            self.stream_controller = Some(StreamController::new(
+                self.config.clone(),
+                self.last_rendered_width.get().map(|w| w.saturating_sub(2)),
+            ));
         }
         if let Some(controller) = self.stream_controller.as_mut()
             && controller.push(&delta)
@@ -715,8 +732,6 @@ impl ChatWidget {
 
     pub(crate) fn handle_exec_approval_now(&mut self, id: String, ev: ExecApprovalRequestEvent) {
         self.flush_answer_stream_with_separator();
-        // Emit the proposed command into history (like proposed patches)
-        self.add_to_history(history_cell::new_proposed_command(&ev.command));
         let command = shlex::try_join(ev.command.iter().map(String::as_str))
             .unwrap_or_else(|_| ev.command.join(" "));
         self.notify(Notification::ExecApprovalRequested { command });
@@ -736,16 +751,12 @@ impl ChatWidget {
         ev: ApplyPatchApprovalRequestEvent,
     ) {
         self.flush_answer_stream_with_separator();
-        self.add_to_history(history_cell::new_patch_event(
-            PatchEventType::ApprovalRequest,
-            ev.changes.clone(),
-            &self.config.cwd,
-        ));
 
         let request = ApprovalRequest::ApplyPatch {
             id,
             reason: ev.reason,
-            grant_root: ev.grant_root,
+            changes: ev.changes.clone(),
+            cwd: self.config.cwd.clone(),
         };
         self.bottom_pane.push_approval_request(request);
         self.request_redraw();
@@ -903,6 +914,8 @@ impl ChatWidget {
             is_review_mode: false,
             ghost_snapshots: Vec::new(),
             ghost_snapshots_disabled: true,
+            needs_final_message_separator: false,
+            last_rendered_width: std::cell::Cell::new(None),
         }
     }
 
@@ -964,6 +977,8 @@ impl ChatWidget {
             is_review_mode: false,
             ghost_snapshots: Vec::new(),
             ghost_snapshots_disabled: true,
+            needs_final_message_separator: false,
+            last_rendered_width: std::cell::Cell::new(None),
         }
     }
 
@@ -1190,6 +1205,7 @@ impl ChatWidget {
 
     fn flush_active_cell(&mut self) {
         if let Some(active) = self.active_cell.take() {
+            self.needs_final_message_separator = true;
             self.app_event_tx.send(AppEvent::InsertHistoryCell(active));
         }
     }
@@ -1202,6 +1218,7 @@ impl ChatWidget {
         if !cell.display_lines(u16::MAX).is_empty() {
             // Only break exec grouping if the cell renders visible lines.
             self.flush_active_cell();
+            self.needs_final_message_separator = true;
         }
         self.app_event_tx.send(AppEvent::InsertHistoryCell(cell));
     }
@@ -1243,6 +1260,7 @@ impl ChatWidget {
         if !text.is_empty() {
             self.add_to_history(history_cell::new_user_prompt(text));
         }
+        self.needs_final_message_separator = false;
     }
 
     fn capture_ghost_snapshot(&mut self) {
@@ -1434,7 +1452,7 @@ impl ChatWidget {
                 } else {
                     // Show explanation when there are no structured findings.
                     let mut rendered: Vec<ratatui::text::Line<'static>> = vec!["".into()];
-                    append_markdown(&explanation, &mut rendered, &self.config);
+                    append_markdown(&explanation, None, &mut rendered, &self.config);
                     let body_cell = AgentMessageCell::new(rendered, false);
                     self.app_event_tx
                         .send(AppEvent::InsertHistoryCell(Box::new(body_cell)));
@@ -1443,7 +1461,7 @@ impl ChatWidget {
                 let message_text =
                     codex_core::review_format::format_review_findings_block(&output.findings, None);
                 let mut message_lines: Vec<ratatui::text::Line<'static>> = Vec::new();
-                append_markdown(&message_text, &mut message_lines, &self.config);
+                append_markdown(&message_text, None, &mut message_lines, &self.config);
                 let body_cell = AgentMessageCell::new(message_lines, true);
                 self.app_event_tx
                     .send(AppEvent::InsertHistoryCell(Box::new(body_cell)));
@@ -1535,16 +1553,16 @@ impl ChatWidget {
     }
 
     pub(crate) fn add_status_output(&mut self) {
-        let default_usage;
-        let usage_ref = if let Some(ti) = &self.token_info {
-            &ti.total_token_usage
+        let default_usage = TokenUsage::default();
+        let (total_usage, context_usage) = if let Some(ti) = &self.token_info {
+            (&ti.total_token_usage, Some(&ti.last_token_usage))
         } else {
-            default_usage = TokenUsage::default();
-            &default_usage
+            (&default_usage, Some(&default_usage))
         };
-        self.add_to_history(history_cell::new_status_output(
+        self.add_to_history(crate::status::new_status_output(
             &self.config,
-            usage_ref,
+            total_usage,
+            context_usage,
             &self.conversation_id,
             self.rate_limit_snapshot.as_ref(),
         ));
@@ -1603,7 +1621,7 @@ impl ChatWidget {
         }
 
         self.bottom_pane.show_selection_view(SelectionViewParams {
-            title: "Select model and reasoning level".to_string(),
+            title: Some("Select model and reasoning level".to_string()),
             subtitle: Some(
                 "Switch between OpenAI models for this and future Codex CLI session".to_string(),
             ),
@@ -1649,7 +1667,7 @@ impl ChatWidget {
         }
 
         self.bottom_pane.show_selection_view(SelectionViewParams {
-            title: "Select Approval Mode".to_string(),
+            title: Some("Select Approval Mode".to_string()),
             footer_hint: Some(STANDARD_POPUP_HINT_LINE.to_string()),
             items,
             ..Default::default()
@@ -1766,6 +1784,20 @@ impl ChatWidget {
         let mut items: Vec<SelectionItem> = Vec::new();
 
         items.push(SelectionItem {
+            name: "Review against a base branch".to_string(),
+            description: Some("(PR Style)".into()),
+            is_current: false,
+            actions: vec![Box::new({
+                let cwd = self.config.cwd.clone();
+                move |tx| {
+                    tx.send(AppEvent::OpenReviewBranchPicker(cwd.clone()));
+                }
+            })],
+            dismiss_on_select: false,
+            search_value: None,
+        });
+
+        items.push(SelectionItem {
             name: "Review uncommitted changes".to_string(),
             description: None,
             is_current: false,
@@ -1799,20 +1831,6 @@ impl ChatWidget {
         });
 
         items.push(SelectionItem {
-            name: "Review against a base branch".to_string(),
-            description: None,
-            is_current: false,
-            actions: vec![Box::new({
-                let cwd = self.config.cwd.clone();
-                move |tx| {
-                    tx.send(AppEvent::OpenReviewBranchPicker(cwd.clone()));
-                }
-            })],
-            dismiss_on_select: false,
-            search_value: None,
-        });
-
-        items.push(SelectionItem {
             name: "Custom review instructions".to_string(),
             description: None,
             is_current: false,
@@ -1824,7 +1842,7 @@ impl ChatWidget {
         });
 
         self.bottom_pane.show_selection_view(SelectionViewParams {
-            title: "Select a review preset".into(),
+            title: Some("Select a review preset".into()),
             footer_hint: Some(STANDARD_POPUP_HINT_LINE.to_string()),
             items,
             ..Default::default()
@@ -1860,7 +1878,7 @@ impl ChatWidget {
         }
 
         self.bottom_pane.show_selection_view(SelectionViewParams {
-            title: "Select a base branch".to_string(),
+            title: Some("Select a base branch".to_string()),
             footer_hint: Some(STANDARD_POPUP_HINT_LINE.to_string()),
             items,
             is_searchable: true,
@@ -1901,7 +1919,7 @@ impl ChatWidget {
         }
 
         self.bottom_pane.show_selection_view(SelectionViewParams {
-            title: "Select a commit to review".to_string(),
+            title: Some("Select a commit to review".to_string()),
             footer_hint: Some(STANDARD_POPUP_HINT_LINE.to_string()),
             items,
             is_searchable: true,
@@ -1961,7 +1979,6 @@ impl ChatWidget {
 
     pub(crate) fn clear_token_usage(&mut self) {
         self.token_info = None;
-        self.bottom_pane.set_token_usage(None);
     }
 
     pub fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
@@ -1986,6 +2003,7 @@ impl WidgetRef for &ChatWidget {
                 tool.render_ref(area, buf);
             }
         }
+        self.last_rendered_width.set(Some(area.width as usize));
     }
 }
 
@@ -2126,7 +2144,7 @@ pub(crate) fn show_review_commit_picker_with_entries(
     }
 
     chat.bottom_pane.show_selection_view(SelectionViewParams {
-        title: "Select a commit to review".to_string(),
+        title: Some("Select a commit to review".to_string()),
         footer_hint: Some(STANDARD_POPUP_HINT_LINE.to_string()),
         items,
         is_searchable: true,
