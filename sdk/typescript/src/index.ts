@@ -9,10 +9,11 @@ export type {
   ItemCompletedEvent,
   ThreadError,
   ThreadErrorEvent,
+  Usage,
 } from "./events";
 export type {
   ThreadItem,
-  AssistantMessageItem,
+  AgentMessageItem,
   ReasoningItem,
   CommandExecutionItem,
   FileChangeItem,

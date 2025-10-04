@@ -33,11 +33,16 @@ describe("Codex", () => {
       const expectedItems = [
         {
           id: expect.any(String),
-          item_type: "assistant_message",
+          type: "agent_message",
           text: "Hi!",
         },
       ];
       expect(result.items).toEqual(expectedItems);
+      expect(result.usage).toEqual({
+        cached_input_tokens: 12,
+        input_tokens: 42,
+        output_tokens: 5,
+      });
       expect(thread.id).toEqual(expect.any(String));
     } finally {
       await close();
